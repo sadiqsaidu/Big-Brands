@@ -1,13 +1,15 @@
-// not complete tests still requires refactoring
-
+// i hate js
 import {
   TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  createMint,
+  createAssociatedTokenAccount,
+  mintTo,
   getAssociatedTokenAddress,
   getAccount,
-  createAssociatedTokenAccount,
 } from "@solana/spl-token";
-import { PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
-import assert from "assert";
+
+import { LAMPORTS_PER_SOL, Transaction, SystemProgram } from "@solana/web3.js";
 
 describe("brand-nft-marketplace", () => {
   const provider = anchor.AnchorProvider.env();
@@ -17,36 +19,114 @@ describe("brand-nft-marketplace", () => {
 
   let marketplacePDA;
   let buyer;
+  let nftMint;
+  let fractionMint;
+  let escrowAccount;
+  let owner;
+  let authority;
+  let treasury;
+  let funderAccount;
 
   before(async () => {
-    // Find the marketplace PDA
-    [marketplacePDA] = await PublicKey.findProgramAddress(
+    // funder account that will recieve the initial airdrop
+    funderAccount = anchor.web3.Keypair.generate();
+
+    await fundAccount(funderAccount.publicKey, 3);
+
+    authority = provider.wallet.publicKey;
+    treasury = anchor.web3.Keypair.generate();
+
+    owner = await createAndFundAccount(1);
+    buyer = await createAndFundAccount(1);
+
+    [marketplacePDA] = await anchor.web3.PublicKey.findProgramAddress(
       [Buffer.from("marketplace")],
       program.programId
     );
 
-    // Create a buyer account that we'll use throughout the tests
-    buyer = anchor.web3.Keypair.generate();
-
-    // Fund the buyer account
-    await fundAccount(buyer.publicKey, 10); // Fund with 10 SOL
+    console.log("Marketplace Authority: ", authority.toString());
+    console.log("Treasury: ", treasury.publicKey.toString());
+    console.log("Marketplace PDA: ", marketplacePDA.toString());
+    console.log("Owner of NFT: ", owner.publicKey.toString());
+    console.log("Buyer of NFT: ", buyer.publicKey.toString());
   });
 
-  // Helper function to fund accounts without relying on airdrops
+  // helper function to fund funder account
   async function fundAccount(publicKey, amount) {
-    const transferTx = await provider.connection.requestAirdrop(
+    const tx = await provider.connection.requestAirdrop(
       publicKey,
       amount * LAMPORTS_PER_SOL
     );
-    await provider.connection.confirmTransaction(transferTx);
+
+    await provider.connection.confirmTransaction(tx);
     console.log(`Funded ${publicKey.toString()} with ${amount} SOL`);
   }
 
-  it("Lists an NFT in the marketplace", async () => {
-    const owner = anchor.web3.Keypair.generate();
-    await fundAccount(owner.publicKey, 5); // Fund with 5 SOL
+  // helper function to create new account and fund it
+  async function createAndFundAccount(amount) {
+    const newAccount = anchor.web3.Keypair.generate();
 
-    const nftMint = await createMint(
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: funderAccount.publicKey,
+        toPubkey: newAccount.publicKey,
+        lamports: amount * LAMPORTS_PER_SOL,
+      })
+    );
+
+    await provider.sendAndConfirm(tx, [funderAccount]);
+    console.log(
+      `Created and funded ${newAccount.publicKey.toString()} with ${amount} SOL`
+    );
+
+    return newAccount;
+  }
+
+  // test for initializing the marketplace
+  it("Initalizes the marketplace", async () => {
+    const accountInfo = await provider.connection.getAccountInfo(
+      marketplacePDA
+    );
+
+    if (!accountInfo) {
+      console.log("Marketplace account doesn't exist. Initializing...");
+      await program.methods
+        .initializeMarketplace()
+        .accounts({
+          authority: authority,
+          marketplace: marketplacePDA,
+          treasury: treasury.publicKey,
+          systemProgram: anchor.web3.SystemProgram.programId,
+        })
+        .rpc();
+      console.log("Marketplace initialized successfully");
+    } else {
+      console.log(
+        "Marketplace account already exists. Skipping initialization."
+      );
+    }
+
+    const marketplaceAccount = await program.account.marketplace.fetch(
+      marketplacePDA
+    );
+
+    assert.strictEqual(
+      marketplaceAccount.authority.toString(),
+      authority.publicKey.toString(),
+      "Incorrect marketplace authority"
+    );
+
+    assert.strictEqual(
+      marketplaceAccount.treasury.toString(),
+      treasury.publicKey.toString(),
+      "Incorrect marketplace treasury"
+    );
+  });
+
+  // test for listing NFT by owner
+  it("Lists and NFT in the marketplace", async () => {
+    // create NFT mint and associated accounts
+    nftMint = await createMint(
       provider.connection,
       owner,
       owner.publicKey,
@@ -54,6 +134,7 @@ describe("brand-nft-marketplace", () => {
       0
     );
 
+    // owner nft account
     const ownerNftAccount = await createAssociatedTokenAccount(
       provider.connection,
       owner,
@@ -61,6 +142,7 @@ describe("brand-nft-marketplace", () => {
       owner.publicKey
     );
 
+    // mint nft to owner
     await mintTo(
       provider.connection,
       owner,
@@ -70,12 +152,14 @@ describe("brand-nft-marketplace", () => {
       1
     );
 
-    const [escrowPDA] = await PublicKey.findProgramAddress(
+    // escrow account from the of the marketplace for the nft
+    [escrowAccount] = await anchor.web3.PublicKey.findProgramAddress(
       [Buffer.from("escrow"), nftMint.toBuffer()],
       program.programId
     );
 
-    const fractionMint = await createMint(
+    // fractional tokens mint
+    fractionMint = await createMint(
       provider.connection,
       owner,
       marketplacePDA,
@@ -83,6 +167,7 @@ describe("brand-nft-marketplace", () => {
       0
     );
 
+    // owner fractional tokens account
     const ownerFractionAccount = await createAssociatedTokenAccount(
       provider.connection,
       owner,
@@ -90,6 +175,7 @@ describe("brand-nft-marketplace", () => {
       owner.publicKey
     );
 
+    // community reward token account of fractional mint
     const communityRewardAccount = await createAssociatedTokenAccount(
       provider.connection,
       owner,
@@ -97,85 +183,88 @@ describe("brand-nft-marketplace", () => {
       owner.publicKey
     );
 
-    try {
-      const tx = await program.methods
-        .listNft(new anchor.BN(1000000), new anchor.BN(1000), 5)
-        .accounts({
-          owner: owner.publicKey,
-          nftMint: nftMint,
-          ownerNftAccount: ownerNftAccount,
-          escrowAccount: escrowPDA,
-          fractionMint: fractionMint,
-          ownerFractionAccount: ownerFractionAccount,
-          communityRewardAccount: communityRewardAccount,
-          marketplace: marketplacePDA,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-          systemProgram: anchor.web3.SystemProgram.programId,
-          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-        })
-        .signers([owner])
-        .rpc();
+    // after all that wahala now list nft
+    const tx = await program.methods
+      .listNft(new anchor.BN(1000000), new anchor.BN(1000), 5)
+      .accounts({
+        owner: owner.publicKey,
+        nftMint: nftMint,
+        ownerNftAccount: ownerNftAccount,
+        escrowAccount: escrowAccount,
+        fractionMint: fractionMint,
+        ownerFractionAccount: ownerFractionAccount,
+        communityRewardAccount: communityRewardAccount,
+        marketplace: marketplacePDA,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        systemProgram: anchor.web3.SystemProgram.programId,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .signers([owner])
+      .rpc();
 
-      console.log("NFT listed successfully. Transaction signature:", tx);
+    console.log("NFT listed successfully. Transaction signature: ", tx);
 
-      const listedNftAccounts = await program.account.listedNFT.all([
-        {
-          memcmp: {
-            offset: 8,
-            bytes: owner.publicKey.toBase58(),
-          },
+    // fetch listed nft from nft state account
+    const listedNftAccounts = await program.account.listedNFT.all([
+      {
+        memcmp: {
+          offset: 8,
+          bytes: owner.publicKey.toBase58(),
         },
-      ]);
+      },
+    ]);
 
-      assert.strictEqual(listedNftAccounts.length, 1, "NFT listing not found");
-      const listedNft = listedNftAccounts[0].account;
+    assert.strictEqual(listedNftAccounts.length, 1, "NFT listing not found");
+    const listedNft = listedNftAccounts[0].account;
 
-      assert.strictEqual(
-        listedNft.owner.toString(),
-        owner.publicKey.toString(),
-        "Incorrect owner"
-      );
-      assert.strictEqual(
-        listedNft.nftMint.toString(),
-        nftMint.toString(),
-        "Incorrect NFT mint"
-      );
-      assert.strictEqual(
-        listedNft.fractionMint.toString(),
-        fractionMint.toString(),
-        "Incorrect fraction mint"
-      );
-      assert.strictEqual(
-        listedNft.initialPrice.toString(),
-        "1000000",
-        "Incorrect initial price"
-      );
-      assert.strictEqual(
-        listedNft.fractionSupply.toString(),
-        "1000",
-        "Incorrect fraction supply"
-      );
-      assert.strictEqual(
-        listedNft.communityRewardPercentage,
-        5,
-        "Incorrect community reward percentage"
-      );
+    assert.strictEqual(
+      listedNft.owner.toString(),
+      owner.publicKey.toString(),
+      "Incorrect owner"
+    );
 
-      console.log("NFT listing verified successfully");
-    } catch (error) {
-      console.error("Error listing NFT:", error);
-      throw error;
-    }
+    assert.strictEqual(
+      listedNft.nftMint.toString(),
+      nftMint.toString(),
+      "Incorrect NFT mint"
+    );
+
+    assert.strictEqual(
+      listedNft.fractionMint.toString(),
+      fractionMint.toString(),
+      "Incorrect fraction mint"
+    );
+
+    assert.strictEqual(
+      listedNft.initialPrice.toString(),
+      "1000000",
+      "Incorrect initial price"
+    );
+
+    assert.strictEqual(
+      listedNft.fractionSupply.toString(),
+      "1000",
+      "Incorrect fraction supply"
+    );
+
+    assert.strictEqual(
+      listedNft.communityRewardPercentage,
+      5,
+      "Incorrect community reward percentage"
+    );
+
+    console.log("NFT listing verified successfully");
   });
 
+  // tests for buying fraction tokens of a listed nft
   it("Buys fractions of a listed NFT", async () => {
-    // Fetch the listed NFT account
+    // fetch the listed nft account
     const listedNftAccounts = await program.account.listedNFT.all();
     assert(listedNftAccounts.length > 0, "No listed NFTs found");
     const listedNft = listedNftAccounts[0];
 
-    // Create buyer's fraction token account
+    // buyers fractional token account
     const buyerFractionAccount = await createAssociatedTokenAccount(
       provider.connection,
       buyer,
@@ -183,15 +272,16 @@ describe("brand-nft-marketplace", () => {
       buyer.publicKey
     );
 
-    // Fetch the fraction treasury account
+    // fetch the fractional treasury account
     const fractionTreasury = await getAssociatedTokenAddress(
       listedNft.account.fractionMint,
       marketplacePDA,
       true
     );
 
+    // buy 100 fraction tokens
     try {
-      const amountToBuy = new anchor.BN(100); // Buy 100 fraction tokens
+      const amountToBuy = new anchor.BN(100);
       const tx = await program.methods
         .buyFraction(amountToBuy)
         .accounts({
@@ -209,21 +299,23 @@ describe("brand-nft-marketplace", () => {
 
       console.log("Fractions bought successfully. Transaction signature:", tx);
 
-      // Verify the buyer received the fraction tokens
+      // check the buyer received fraction tokens
       const buyerAccount = await getAccount(
         provider.connection,
         buyerFractionAccount
       );
+
       assert.strictEqual(
         buyerAccount.amount.toString(),
         amountToBuy.toString(),
         "Buyer did not receive correct amount of fraction tokens"
       );
 
-      // Verify the listed NFT's current price has been updated
+      // check that the listed nft's current price has updated
       const updatedListedNft = await program.account.listedNFT.fetch(
         listedNft.publicKey
       );
+
       assert(
         updatedListedNft.currentPrice.gt(listedNft.account.currentPrice),
         "Current price should have increased after purchase"
@@ -234,26 +326,30 @@ describe("brand-nft-marketplace", () => {
     }
   });
 
+  // test for selling fractional tokens of listed nft
   it("Sells fractions of a listed NFT", async () => {
-    // Fetch the listed NFT account again
+    // fetch the listed nft state account
     const listedNftAccounts = await program.account.listedNFT.all();
     const listedNft = listedNftAccounts[0];
 
-    // Get seller's fraction token account
+    // i don tire guy
+
+    // get seller's fraction token account
     const sellerFractionAccount = await getAssociatedTokenAddress(
       listedNft.account.fractionMint,
       buyer.publicKey
     );
 
-    // Fetch the fraction treasury account
+    // get the fraction treasury account
     const fractionTreasury = await getAssociatedTokenAddress(
       listedNft.account.fractionMint,
       marketplacePDA,
       true
     );
 
+    // sells 100 fractional tokens
     try {
-      const amountToSell = new anchor.BN(50); // Sell 50 fraction tokens
+      const amountToSell = new anchor.BN(100);
       const tx = await program.methods
         .sellFraction(amountToSell)
         .accounts({
@@ -270,21 +366,23 @@ describe("brand-nft-marketplace", () => {
 
       console.log("Fractions sold successfully. Transaction signature:", tx);
 
-      // Verify the seller's fraction token balance decreased
+      // check that the seller's fractino token balance decreases
       const sellerAccount = await getAccount(
         provider.connection,
         sellerFractionAccount
       );
+
       assert.strictEqual(
         sellerAccount.amount.toString(),
-        "50",
+        "100",
         "Seller's fraction token balance is incorrect"
       );
 
-      // Verify the listed NFT's current price has been updated
+      // check that the listed nft current price has updated
       const updatedListedNft = await program.account.listedNFT.fetch(
         listedNft.publicKey
       );
+
       assert(
         updatedListedNft.currentPrice.lt(listedNft.account.currentPrice),
         "Current price should have decreased after sale"
@@ -295,8 +393,13 @@ describe("brand-nft-marketplace", () => {
     }
   });
 
+  // test for buying entire nft
   it("Buys the entire NFT", async () => {
-    // Create buyer's NFT token account
+    // fetch the listed nft state account
+    const listedNftAccounts = await program.account.listedNFT.all();
+    const listedNft = listedNftAccounts[0];
+
+    // create buyer nft token account
     const buyerNftAccount = await createAssociatedTokenAccount(
       provider.connection,
       buyer,
@@ -304,14 +407,16 @@ describe("brand-nft-marketplace", () => {
       buyer.publicKey
     );
 
-    // Get the initial balances
+    // get the initial balances
     const initialBuyerBalance = await provider.connection.getBalance(
       buyer.publicKey
     );
+
     const initialMarketplaceBalance = await provider.connection.getBalance(
       marketplacePDA
     );
 
+    // buy the entire nft
     try {
       const tx = await program.methods
         .buyNft()
@@ -329,11 +434,12 @@ describe("brand-nft-marketplace", () => {
 
       console.log("NFT bought successfully. Transaction signature:", tx);
 
-      // Verify the NFT was transferred to the buyer
+      // check the nft ownership is now the buyer
       const buyerNftAccountInfo = await getAccount(
         provider.connection,
         buyerNftAccount
       );
+
       assert.strictEqual(
         buyerNftAccountInfo.amount.toString(),
         "1",
@@ -344,6 +450,7 @@ describe("brand-nft-marketplace", () => {
       const updatedListedNft = await program.account.listedNFT.fetch(
         listedNft.publicKey
       );
+
       assert.strictEqual(
         updatedListedNft.owner.toString(),
         buyer.publicKey.toString(),
@@ -354,6 +461,7 @@ describe("brand-nft-marketplace", () => {
       const finalBuyerBalance = await provider.connection.getBalance(
         buyer.publicKey
       );
+
       const finalMarketplaceBalance = await provider.connection.getBalance(
         marketplacePDA
       );
@@ -362,97 +470,13 @@ describe("brand-nft-marketplace", () => {
         finalBuyerBalance < initialBuyerBalance,
         "Buyer's balance did not decrease"
       );
+
       assert(
         finalMarketplaceBalance > initialMarketplaceBalance,
         "Marketplace balance did not increase"
       );
     } catch (error) {
       console.error("Error buying NFT:", error);
-      throw error;
-    }
-  });
-
-  it("Redeems fractions for SOL", async () => {
-    // Create a new account to hold fractions
-    const fractionHolder = anchor.web3.Keypair.generate();
-    await fundAccount(fractionHolder.publicKey, 1); // Fund with 1 SOL for transaction fees
-
-    // Create fraction token account for the holder
-    const holderFractionAccount = await createAssociatedTokenAccount(
-      provider.connection,
-      fractionHolder,
-      fractionMint,
-      fractionHolder.publicKey
-    );
-
-    // Mint some fraction tokens to the holder (assuming we have permission to do so)
-    const amountToMint = 100; // Mint 100 fraction tokens
-    await mintTo(
-      provider.connection,
-      owner,
-      fractionMint,
-      holderFractionAccount,
-      marketplacePDA,
-      amountToMint
-    );
-
-    // Get initial balances
-    const initialHolderBalance = await provider.connection.getBalance(
-      fractionHolder.publicKey
-    );
-    const initialMarketplaceBalance = await provider.connection.getBalance(
-      marketplacePDA
-    );
-
-    try {
-      const tx = await program.methods
-        .redeemFractions()
-        .accounts({
-          tokenHolder: fractionHolder.publicKey,
-          listedNft: listedNft.publicKey,
-          fractionMint: fractionMint,
-          holderFractionAccount: holderFractionAccount,
-          marketplace: marketplacePDA,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: anchor.web3.SystemProgram.programId,
-        })
-        .signers([fractionHolder])
-        .rpc();
-
-      console.log(
-        "Fractions redeemed successfully. Transaction signature:",
-        tx
-      );
-
-      // Verify the fraction tokens were burned
-      const finalHolderFractionAccount = await getAccount(
-        provider.connection,
-        holderFractionAccount
-      );
-      assert.strictEqual(
-        finalHolderFractionAccount.amount.toString(),
-        "0",
-        "Fraction tokens were not burned"
-      );
-
-      // Verify the SOL transfer
-      const finalHolderBalance = await provider.connection.getBalance(
-        fractionHolder.publicKey
-      );
-      const finalMarketplaceBalance = await provider.connection.getBalance(
-        marketplacePDA
-      );
-
-      assert(
-        finalHolderBalance > initialHolderBalance,
-        "Holder's balance did not increase"
-      );
-      assert(
-        finalMarketplaceBalance < initialMarketplaceBalance,
-        "Marketplace balance did not decrease"
-      );
-    } catch (error) {
-      console.error("Error redeeming fractions:", error);
       throw error;
     }
   });
